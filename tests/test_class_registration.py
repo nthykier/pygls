@@ -1,7 +1,21 @@
+import contextlib
+
 import pytest
 from lsprotocol.types import TEXT_DOCUMENT_COMPLETION
 
+from pygls.protocol.language_server import PENDING_USER_LSP_METHODS
 from pygls.server import LanguageServer
+
+
+@contextlib.contextmanager
+@pytest.fixture(autouse=True)
+def reset_state() -> None:
+    try:
+        yield
+    finally:
+        # Reset after each test to ensure incorrect usage tests do no contaminate
+        # other tests.
+        PENDING_USER_LSP_METHODS.clear()
 
 
 def test_instance_based_registration() -> None:
@@ -30,7 +44,7 @@ def test_class_based_registration() -> None:
     assert TEXT_DOCUMENT_COMPLETION in ls.lsp.fm.features
 
 
-def test_class_based_registration_incorrect() -> None:
+def test_class_based_registration_incorrect_before() -> None:
 
     @LanguageServer.feature(TEXT_DOCUMENT_COMPLETION)
     def do_nothing(ls, param):
@@ -42,7 +56,7 @@ def test_class_based_registration_incorrect() -> None:
             pass
 
 
-def test_class_based_registration_incorrect() -> None:
+def test_class_based_registration_incorrect_after() -> None:
 
     class TestLanguageServer(LanguageServer):
         pass
