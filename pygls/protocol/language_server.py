@@ -31,6 +31,7 @@ from typing import (
     Union,
     Any,
     cast,
+    Tuple,
 )
 
 
@@ -103,6 +104,9 @@ F = TypeVar("F", bound=Callable)
 logger = logging.getLogger(__name__)
 
 
+PENDING_USER_LSP_METHODS: List[Tuple["LSPMethod", "F"]] = []
+
+
 class LSPMethod:
 
     def __init__(
@@ -124,6 +128,45 @@ def lsp_method(method_name: str) -> Callable[[F], F]:
         return f
 
     return decorator
+
+
+def lsp_user_method(
+    method_name: str, *, registration_options: Optional[Any]
+) -> Callable[[F], F]:
+    def decorator(f: F) -> F:
+        # Ideally, we would like to validate that f is associated with an LSP class. Unfortunately,
+        # that is not a possibility. Unfortunately, unbound methods have basically nothing pointing
+        # them back to their defining class. Even if they did, we would need it to work while
+        # the defining class is still being defined (which is an even greater ask).
+        #
+        # Instead, we register later and impose self-checks at various "opportune" moments.
+        method_metadata = LSPMethod(
+            method_name,
+            registration_options=registration_options,
+            is_pygls_builtin=False,
+        )
+        PENDING_USER_LSP_METHODS.append((method_metadata, f))
+        f.method_name = method_metadata  # type: ignore[attr-defined]
+        return f
+
+    return decorator
+
+
+def lsp_assert_no_pending_lsp_user_methods() -> None:
+    logging.debug("Performing self-check")
+    if PENDING_USER_LSP_METHODS:
+        m, f = PENDING_USER_LSP_METHODS[0]
+        raise TypeError(
+            "Class based LanguageServer.feature used on non-instance methods or LanguageServer"
+            " initialized in the middle of defining a subclass. Either of which will give"
+            f" incorrect results. The function that triggered this error was {f.__qualname__}"
+            f" (with LSP method {m.method_name}). If you wanted to register a non-class"
+            f" function, please use `ls = LanguageServer(...)` + `@ls.feature(...)` instead."
+            f" If you wanted to register a class method, please ensure it is defined inside"
+            f" the proper subclass of `LanguageServer` and avoid initializing an instance"
+            f" of any `LanguageServer` (or subclass thereof) until the subclass has been"
+            f" fully defined."
+        )
 
 
 class LanguageServerProtocol(JsonRPCProtocol, metaclass=LSPMeta):

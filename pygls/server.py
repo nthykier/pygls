@@ -20,6 +20,7 @@ import logging
 import re
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import wraps
 from threading import Event
 from typing import (
     Any,
@@ -30,6 +31,8 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    ClassVar,
+    cast,
 )
 
 import cattrs
@@ -58,6 +61,12 @@ from lsprotocol.types import (
 )
 from pygls.progress import Progress
 from pygls.protocol import JsonRPCProtocol, LanguageServerProtocol, default_converter
+from pygls.protocol.language_server import (
+    lsp_assert_no_pending_lsp_user_methods,
+    lsp_user_method,
+    PENDING_USER_LSP_METHODS,
+    LSPMethod,
+)
 from pygls.workspace import Workspace
 
 if not IS_PYODIDE:
@@ -75,6 +84,24 @@ ServerErrors = Union[
     Type[FeatureNotificationError],
     Type[FeatureRequestError],
 ]
+
+
+class hybridmethod(object):
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, obj, cls):
+        context = obj if obj is not None else cls
+
+        @wraps(self.func)
+        def hybrid(*args, **kw):
+            return self.func(context, *args, **kw)
+
+        # optional, mimic methods some more
+        hybrid.__func__ = hybrid.im_func = self.func
+        hybrid.__self__ = hybrid.im_self = context
+
+        return hybrid
 
 
 async def aio_readline(loop, executor, stop_event, rfile, proxy):
@@ -244,9 +271,24 @@ class Server:
             logger.info("Closing the event loop.")
             self.loop.close()
 
+    def _start_self_check(self) -> None:
+        # In case someone used `@LanguageServer.feature` where they should have used
+        # `@ls.feature` this is the most opportune where we can catch it without adding
+        # overhead to all LSP methods. Note, it might seem tempting to do it in `__init__`,
+        # but that leads to a logical fallacy since `__init__` must be called before
+        # `ls.feature` can be used. That is, the check would always be too early if we
+        # move it to `__init__`.
+        #
+        # This could also happen in initialize, but doing it at start means it is caught
+        # much earlier, and it is easier for people to debug (since they do not have to
+        # start a client to catch it).
+
+        lsp_assert_no_pending_lsp_user_methods()
+
     def start_io(self, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] = None):
         """Starts IO server."""
         logger.info("Starting IO server")
+        self._start_self_check()
 
         self._stop_event = Event()
         transport = StdOutTransportAdapter(
@@ -273,6 +315,7 @@ class Server:
 
     def start_pyodide(self):
         logger.info("Starting Pyodide server")
+        self._start_self_check()
 
         # Note: We don't actually start anything running as the main event
         # loop will be handled by the web platform.
@@ -283,6 +326,8 @@ class Server:
     def start_tcp(self, host: str, port: int) -> None:
         """Starts TCP server."""
         logger.info("Starting TCP server on %s:%s", host, port)
+
+        self._start_self_check()
 
         self._stop_event = Event()
         self._server = self.loop.run_until_complete(  # type: ignore[assignment]
@@ -302,6 +347,8 @@ class Server:
         except ImportError:
             logger.error("Run `pip install pygls[ws]` to install `websockets`.")
             sys.exit(1)
+
+        self._start_self_check()
 
         logger.info("Starting WebSocket server on {}:{}".format(host, port))
 
@@ -349,6 +396,14 @@ class Server:
             return self._thread_pool_executor
 
 
+def _wrap(func) -> Any:
+
+    def _wrapper(*args, **kwargs) -> None:
+        return func(*args, **kwargs)
+
+    return _wrapper
+
+
 class LanguageServer(Server):
     """The default LanguageServer
 
@@ -392,6 +447,8 @@ class LanguageServer(Server):
 
     lsp: LanguageServerProtocol
 
+    lsp_user_methods: ClassVar[List[str]] = []
+
     default_error_message = (
         "Unexpected error in LSP server, see server's logs for details"
     )
@@ -422,6 +479,102 @@ class LanguageServer(Server):
         self._notebook_document_sync = notebook_document_sync
         self.process_id: Optional[Union[int, None]] = None
         super().__init__(protocol_cls, converter_factory, loop, max_workers)
+        self._register_class_based_features()
+
+    def __init_subclass__(cls, **kwargs):
+        features_to_register = []
+        already_seen_features = set()
+        for parent_class in cls.__mro__:
+            # parent classes "above" LanguageServer (Server + object) does not have the attribute
+            #
+            # Since each class aggregates all methods, it might be tempting to just resolve the
+            # first non-empty version of `lsp_user_methods`. That will work until someone does
+            # a "diamond" shaped MRO such as: `class D(B, C)`
+            #
+            # Probably no one will, but let us just get it right and move on.
+            lum = getattr(parent_class, "lsp_user_methods", None)
+            if not lum:
+                continue
+            for m in lum:
+                if m in already_seen_features:
+                    continue
+                already_seen_features.add(m)
+                features_to_register.append(m)
+
+        for lsp_method, reg_func in PENDING_USER_LSP_METHODS:
+            func_name = reg_func.__name__
+            func = getattr(cls, reg_func.__name__, None)
+
+            if lsp_method.is_pygls_builtin:
+                # Should not happen due to how `PENDING_USER_LSP_METHODS` is defined. But stop the error
+                # here, if someone breaks the definition of `PENDING_USER_LSP_METHODS` or it gets contaminated
+                # for some reason.
+                raise TypeError(
+                    f"The {cls.__qualname__}.{func_name} is defined to be a pygls builtin and a user"
+                    f" defined LSP method at the same time, which should not happen."
+                )
+
+            if func is None or not callable(func):
+                raise TypeError(
+                    f'Expected "{cls.__qualname__}.{func_name}" to be a LSP method, but the'
+                    f" attribute does not exist or it is not a callable."
+                )
+
+            method_metadata = getattr(func, "method_name", None)
+            if method_metadata != lsp_method:
+                raise TypeError(
+                    f'Expected "{cls.__qualname__}.{func_name}" to be a LSP method, but the'
+                    f" relevant metadata is not present.  If the method is using non-pygls"
+                    f" decorators, one of them is not transparently providing access to"
+                    f" the necessary `pygls` metadata. Otherwise,"
+                    f" `LanguageServer.feature` might have been used on a"
+                    f' non-class function of same name as "{cls.__qualname__}.{func_name}"'
+                    f" (where the instance version should have been instead) while"
+                    f" defining {cls.__qualname__}"
+                )
+            if func_name not in already_seen_features:
+                already_seen_features.add(func_name)
+                features_to_register.append(func_name)
+
+        logger.debug(f"{cls.__qualname__} has {len(features_to_register)} class-based user defined features")
+        cls.lsp_user_methods = features_to_register
+        PENDING_USER_LSP_METHODS.clear()
+
+    def _register_class_based_features(self):
+        """Registers generic LSP features from this class."""
+
+        for name in self.lsp_user_methods:
+            logger.debug(f"Resolving LSP metadata for {self.__class__.__qualname__}.{name}")
+            attr = getattr(self, name)
+            # Note we already resolve the methods at instance, since then we can worry less about subclasses
+            # overriding methods and stuff like that.
+            if callable(attr) and hasattr(attr, "method_name"):
+                method_metadata: "LSPMethod" = cast("LSPMethod", attr.method_name)
+                if method_metadata is None:
+                    raise TypeError(
+                        f"Expected {self.__class__.__qualname__}.{name} to have LSP metadata, but it is"
+                        f" missing for some reason."
+                    )
+                if method_metadata.is_pygls_builtin:
+                    # Should not happen due to how `PENDING_USER_LSP_METHODS` is defined. But stop the error
+                    # here, if someone breaks the definition of `PENDING_USER_LSP_METHODS` or it gets contaminated
+                    # for some reason.
+                    #
+                    # This check is also in `__subclass_init__` as a fail-fast and the most common case. This
+                    # check here will instead catch unsafe monkey patching (which `__subclass_init__` cannot see,
+                    # since it would happen after that call).
+                    raise TypeError(
+                        f"The {self.__class__.__qualname__}.{name} is defined to be a pygls builtin and a user"
+                        f" defined LSP method at the same time, which should not happen."
+                    )
+                d = self.lsp.fm.feature(
+                    method_metadata.method_name,
+                    method_metadata.registration_options,
+                    enable_ls_injection=False,
+                )
+                # We wrap the bound method, because python does not like our custom attributes on a bound method
+                # (but it is fine with them on a wrapper).
+                d(_wrap(attr))
 
     def apply_edit(
         self, edit: WorkspaceEdit, label: Optional[str] = None
@@ -453,7 +606,10 @@ class LanguageServer(Server):
         """The client's capabilities."""
         return self.lsp.client_capabilities
 
+    @hybridmethod
     def feature(
+        # Really, it is `self_or_cls`.  Using `self` to avoid triggering various
+        # linters expecting a `self`.
         self,
         feature_name: str,
         options: Optional[Any] = None,
@@ -468,7 +624,14 @@ class LanguageServer(Server):
            def completions(ls, params: CompletionParams):
                return CompletionList(is_incomplete=False, items=[CompletionItem("Completion 1")])
         """
-        return self.lsp.fm.feature(feature_name, options)
+        if isinstance(self, LanguageServer):
+            # Instance method case
+            return self.lsp.fm.feature(feature_name, options)
+        # Class method case
+        return lsp_user_method(
+            feature_name,
+            registration_options=options,
+        )
 
     def get_configuration(
         self,
