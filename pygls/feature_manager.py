@@ -162,6 +162,8 @@ class FeatureManager:
         self,
         feature_name: str,
         options: Optional[Any] = None,
+        *,
+        enable_ls_injection: bool = True,
     ) -> Callable:
         """Decorator used to register LSP features.
 
@@ -182,7 +184,7 @@ class FeatureManager:
 
             assign_help_attrs(f, feature_name, ATTR_FEATURE_TYPE)
 
-            wrapped = wrap_with_server(f, self.server)
+            wrapped = wrap_with_server(f, self.server) if enable_ls_injection else f
             # Assign help attributes for thread decorator
             assign_help_attrs(wrapped, feature_name, ATTR_FEATURE_TYPE)
 
