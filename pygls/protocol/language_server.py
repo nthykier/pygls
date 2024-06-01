@@ -29,6 +29,8 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    Any,
+    cast,
 )
 
 
@@ -101,9 +103,24 @@ F = TypeVar("F", bound=Callable)
 logger = logging.getLogger(__name__)
 
 
+class LSPMethod:
+
+    def __init__(
+        self,
+        method_name: str,
+        *,
+        registration_options: Optional[Any] = None,
+        is_pygls_builtin: bool = False,
+    ) -> None:
+        self.method_name = method_name
+        self.is_pygls_builtin = is_pygls_builtin
+        self.registration_options = registration_options
+
+
 def lsp_method(method_name: str) -> Callable[[F], F]:
     def decorator(f: F) -> F:
-        f.method_name = method_name  # type: ignore[attr-defined]
+        method_metadata = LSPMethod(method_name, is_pygls_builtin=True)
+        f.method_name = method_metadata  # type: ignore[attr-defined]
         return f
 
     return decorator
@@ -143,7 +160,10 @@ class LanguageServerProtocol(JsonRPCProtocol, metaclass=LSPMeta):
 
             attr = getattr(self, name)
             if callable(attr) and hasattr(attr, "method_name"):
-                self.fm.add_builtin_feature(attr.method_name, attr)
+                method_metadata: "LSPMethod" = cast("LSPMethod", attr.method_name)
+                if not method_metadata.is_pygls_builtin:
+                    continue
+                self.fm.add_builtin_feature(method_metadata.method_name, attr)
 
     @property
     def workspace(self) -> Workspace:

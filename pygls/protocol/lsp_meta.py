@@ -1,8 +1,12 @@
 import functools
 import logging
+from typing import cast, TYPE_CHECKING
+
 from pygls.constants import ATTR_FEATURE_TYPE
 from pygls.feature_manager import assign_help_attrs
 
+if TYPE_CHECKING:
+    from pygls.protocol.language_server import LSPMethod
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,11 @@ class LSPMeta(type):
     def __new__(mcs, cls_name, cls_bases, cls):
         for attr_name, attr_val in cls.items():
             if callable(attr_val) and hasattr(attr_val, "method_name"):
-                method_name = attr_val.method_name
+                method_metadata: "LSPMethod" = cast("LSPMethod", attr_val.method_name)
+                if not method_metadata.is_pygls_builtin:
+                    # This mechanism is only defined for pygls builtin features.
+                    continue
+                method_name = method_metadata.method_name
                 wrapped = call_user_feature(attr_val, method_name)
                 assign_help_attrs(wrapped, method_name, ATTR_FEATURE_TYPE)
                 cls[attr_name] = wrapped
